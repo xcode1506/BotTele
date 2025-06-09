@@ -1,0 +1,167 @@
+
+import os
+import logging
+from telegram import Update
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+from sqlalchemy import create_engine, Column, Integer, String, Boolean
+from sqlalchemy.orm import declarative_base, sessionmaker
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# --- Konfigurasi dasar ---
+TOKEN = os.getenv("7481468657:AAGFvQ4rumDoWQEnb9aQBcph3Py3b0vHN0g")
+DATABASE_URL = os.getenv("DATABASE_URL")
+ADMIN_IDS = list(map(int, os.getenv("VacantMinded", "").split(",")))
+
+# --- Logging ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# --- Database ---
+Base = declarative_base()
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True)
+    age = Column(Integer)
+    country = Column(String)
+    gender = Column(String)
+    preference = Column(String)
+    is_paid = Column(Boolean, default=False)
+
+engine = create_engine(DATABASE_URL)
+Base.metadata.create_all(engine)
+SessionLocal = sessionmaker(bind=engine)
+
+user_states = {}
+
+def start(update: Update, context: CallbackContext):
+    update.message.reply_text("Selamat datang di Bot Jodoh! Ketik /register untuk mulai mencari jodoh.")
+
+def register(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+    user_states[user_id] = {'step': 'age'}
+    update.message.reply_text("Masukkan usia Anda:")
+
+def handle_message(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+    text = update.message.text.lower()
+
+    if user_id not in user_states:
+        update.message.reply_text("Ketik /register untuk mulai.")
+        return
+
+    state = user_states[user_id]
+    step = state.get('step')
+
+    if step == 'age':
+        try:
+            age = int(text)
+            state['age'] = age
+            state['step'] = 'country'
+            update.message.reply_text("Dari negara mana Anda?")
+        except ValueError:
+            update.message.reply_text("Usia harus angka. Coba lagi.")
+
+    elif step == 'country':
+        state['country'] = text
+        state['step'] = 'gender'
+        update.message.reply_text("Apa jenis kelamin Anda? (pria/wanita)")
+
+    elif step == 'gender':
+        if text not in ['pria', 'wanita']:
+            update.message.reply_text("Masukkan pria atau wanita.")
+            return
+        state['gender'] = text
+        state['step'] = 'preference'
+        update.message.reply_text("Ingin pasangan jenis kelamin apa? (pria/wanita)")
+
+    elif step == 'preference':
+        if text not in ['pria', 'wanita']:
+            update.message.reply_text("Masukkan pria atau wanita.")
+            return
+        state['preference'] = text
+        is_paid = check_payment(user_id)
+        save_user(user_id, state, is_paid)
+        del user_states[user_id]
+
+        update.message.reply_text("✅ Data disimpan! Mencari pasangan...")
+        match = find_match(user_id)
+        if match:
+            update.message.reply_text(f"🎉 Match ditemukan dengan pengguna {match.id}, {match.gender} dari {match.country}, usia {match.age}.")
+        else:
+            update.message.reply_text("Belum ada match yang cocok, silakan tunggu.")
+
+def save_user(user_id, data, is_paid):
+    session = SessionLocal()
+    user = session.query(User).filter_by(id=user_id).first()
+    if not user:
+        user = User(id=user_id)
+        session.add(user)
+    user.age = data['age']
+    user.country = data['country']
+    user.gender = data['gender']
+    user.preference = data['preference'] if is_paid else 'any'
+    user.is_paid = is_paid
+    session.commit()
+    session.close()
+
+def check_payment(user_id):
+    session = SessionLocal()
+    user = session.query(User).filter_by(id=user_id).first()
+    session.close()
+    return user.is_paid if user else False
+
+def find_match(user_id):
+    session = SessionLocal()
+    user = session.query(User).filter_by(id=user_id).first()
+    if not user:
+        session.close()
+        return None
+    candidates = session.query(User).filter(
+        User.id != user.id,
+        User.gender == user.preference if user.preference != 'any' else True,
+        User.preference.in_(['any', user.gender]),
+        abs(User.age - user.age) <= 5
+    ).all()
+    session.close()
+    return candidates[0] if candidates else None
+
+def upgrade(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+    session = SessionLocal()
+    user = session.query(User).filter_by(id=user_id).first()
+    if user:
+        user.is_paid = True
+        session.commit()
+        update.message.reply_text("🎉 Anda sekarang pengguna premium!")
+    else:
+        update.message.reply_text("Silakan daftar dulu dengan /register")
+    session.close()
+
+def admin(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+    if user_id not in ADMIN_IDS:
+        update.message.reply_text("❌ Akses ditolak.")  
+        return
+    session = SessionLocal()
+    total = session.query(User).count()
+    users = session.query(User).limit(10).all()
+    session.close()
+    info = "\n".join([f"{u.id}: {u.gender}, {u.age}, {u.country}, premium={u.is_paid}" for u in users])
+    update.message.reply_text(f"👑 Total user: {total}\nContoh data:\n{info}")
+
+def main():
+    updater = Updater(TOKEN, use_context=True)
+    dp = updater.dispatcher
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("register", register))
+    dp.add_handler(CommandHandler("upgrade", upgrade))
+    dp.add_handler(CommandHandler("admin", admin))
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
+    updater.start_polling()
+    updater.idle()
+
+if __name__ == '__main__':
+    main()
